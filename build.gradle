@@ -20,7 +20,13 @@ import java.nio.charset.StandardCharsets
 
 buildscript {
   repositories {
-    mavenCentral()
+    // mavenCentral()
+    maven {
+      url 'https://maven.aliyun.com/nexus/content/groups/public/'
+    }
+    maven {
+      url 'https://maven.aliyun.com/nexus/content/repositories/jcenter'
+    }
   }
   apply from: "$rootDir/gradle/dependencies.gradle"
 
@@ -98,9 +104,9 @@ ext {
   userEnableTestCoverage = project.hasProperty("enableTestCoverage") ? enableTestCoverage : false
 
   userKeepAliveModeString = project.hasProperty("keepAliveMode") ? keepAliveMode : "daemon"
-  userKeepAliveMode = KeepAliveMode.values().find(m -> m.name().toLowerCase().equals(userKeepAliveModeString))
+  userKeepAliveMode = KeepAliveMode.values().find { it.name().toLowerCase().equals(userKeepAliveModeString) }
   if (userKeepAliveMode == null) {
-    def keepAliveValues = KeepAliveMode.values().collect(m -> m.name.toLowerCase())
+    def keepAliveValues = KeepAliveMode.values().collect { it.name().toLowerCase() }
     throw new GradleException("Unexpected value for keepAliveMode property. Expected one of $keepAliveValues, but received: $userKeepAliveModeString")
   }
 
@@ -126,7 +132,13 @@ ext {
 allprojects {
 
   repositories {
-    mavenCentral()
+    // mavenCentral()
+    maven {
+      url 'https://maven.aliyun.com/nexus/content/groups/public/'
+    }
+    maven {
+      url 'https://maven.aliyun.com/nexus/content/repositories/jcenter'
+    }
   }
 
   dependencyUpdates {
