@@ -27,6 +27,10 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -37,64 +41,94 @@ import javax.security.auth.callback.Callback;
 import javax.security.auth.callback.NameCallback;
 import javax.security.auth.callback.UnsupportedCallbackException;
 import javax.security.auth.login.AppConfigurationEntry;
-import javax.security.auth.login.Configuration;
 
 /**
- * Dynamic PLAIN SASL callback handler that supports runtime credential updates.
- * This handler provides a unified approach to dynamic SASL updates across
- * different Kafka versions.
+ * Dynamic PLAIN SASL callback handler with separated static and dynamic
+ * credentials.
+ * 
+ * Architecture:
+ * - Static credentials: Loaded from JAAS config at startup (admin, system
+ * accounts)
+ * - Dynamic credentials: Loaded from a single file, support hot-reload (regular
+ * users)
  * 
  * Features:
  * - Thread-safe credential cache with read-write locks
- * - Support for dynamic credential updates without broker restart
- * - Compatible with both pre-3.9 and 3.9+ KRaft versions
- * - Custom business logic for authentication validation
+ * - MD5 password hashing for security
+ * - Automatic file reload when modified
+ * - Zero-downtime credential updates
+ * - Kubernetes Secret/ConfigMap compatible
  * 
- * Configuration example:
+ * Configuration:
+ * 
+ * 1. System property or environment variable for dynamic credentials:
+ * -Dkafka.dynamic.credential.file=/path/to/users.properties
+ * or KAFKA_DYNAMIC_CREDENTIAL_FILE=/path/to/users.properties
+ * 
+ * 2. server.properties:
  * listener.name.sasl_ssl.plain.sasl.server.callback.handler.class=org.apache.kafka.common.security.plain.internals.DynamicPlainServerCallbackHandler
+ * 
+ * 3. Static JAAS config (kafka_jaas.conf) - system managed, not exposed to
+ * users:
+ * KafkaServer {
+ * org.apache.kafka.common.security.plain.PlainLoginModule required
+ * username="admin"
+ * password="21232f297a57a5a743894a0e4a801fc3"
+ * user_admin="21232f297a57a5a743894a0e4a801fc3";
+ * };
+ * 
+ * 4. Dynamic credential file - user managed, hot-reloadable:
+ * File: /path/to/users.properties
+ * Format: username=md5hash (one per line)
+ * 
+ * producer=5f4dcc3b5aa765d61d8327deb882cf99
+ * consumer=098f6bcd4621d373cade4e832627b4f6
+ * app-user=5ebe2294ecd0e0f08eab7690d2a6ee69
+ * 
+ * Generate MD5 hash: echo -n "your_password" | md5sum
  */
 public class DynamicPlainServerCallbackHandler implements AuthenticateCallbackHandler {
 
     private static final Logger log = LoggerFactory.getLogger(DynamicPlainServerCallbackHandler.class);
     private static final String JAAS_USER_PREFIX = "user_";
-    private static final String JAAS_CONFIG_PROPERTY = "java.security.auth.login.config";
+    private static final String CREDENTIAL_FILE_PROPERTY = "kafka.dynamic.credential.file";
+    private static final String CREDENTIAL_FILE_ENV = "KAFKA_DYNAMIC_CREDENTIAL_FILE";
 
-    // Thread-safe credential cache
-    private final Map<String, String> credentialCache = new ConcurrentHashMap<>();
+    private final Map<String, String> staticCredentials = new ConcurrentHashMap<>();
+    private final Map<String, String> dynamicCredentials = new ConcurrentHashMap<>();
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
 
-    // JAAS file tracking
-    private String jaasConfigFilePath;
+    private String credentialFile;
     private volatile long lastModifiedTime = 0L;
-
-    private List<AppConfigurationEntry> jaasConfigEntries;
     private volatile boolean initialized = false;
 
     @Override
     public void configure(Map<String, ?> configs, String mechanism, List<AppConfigurationEntry> jaasConfigEntries) {
-        this.jaasConfigEntries = jaasConfigEntries;
+        loadStaticCredentialsFromJaas(jaasConfigEntries);
 
-        // Get JAAS file path from system property
-        this.jaasConfigFilePath = System.getProperty(JAAS_CONFIG_PROPERTY);
-
-        if (jaasConfigFilePath != null) {
-            File jaasFile = new File(jaasConfigFilePath);
-            if (jaasFile.exists()) {
-                this.lastModifiedTime = jaasFile.lastModified();
-                log.info("Monitoring JAAS config file: {} (last modified: {})",
-                        jaasConfigFilePath, lastModifiedTime);
-            } else {
-                log.warn("JAAS config file does not exist: {}", jaasConfigFilePath);
-            }
-        } else {
-            log.info("No JAAS config file specified via {}, dynamic reload disabled",
-                    JAAS_CONFIG_PROPERTY);
+        credentialFile = System.getProperty(CREDENTIAL_FILE_PROPERTY);
+        if (credentialFile == null) {
+            credentialFile = System.getenv(CREDENTIAL_FILE_ENV);
         }
 
-        // Load initial credentials from JAAS configuration
-        loadCredentialsFromJaas();
+        if (credentialFile != null) {
+            File file = new File(credentialFile);
+            if (file.exists() && file.isFile()) {
+                loadDynamicCredentials();
+                log.info("Monitoring credential file: {} ({} users loaded)",
+                        credentialFile, dynamicCredentials.size());
+            } else {
+                log.warn("Credential file does not exist or is not a file: {}", credentialFile);
+            }
+        } else {
+            log.info("No credential file configured ({}), only static JAAS credentials available",
+                    CREDENTIAL_FILE_PROPERTY);
+        }
+
         this.initialized = true;
-        log.info("DynamicPlainServerCallbackHandler configured with mechanism: {}", mechanism);
+        log.info("DynamicPlainServerCallbackHandler configured with mechanism: {} " +
+                "(static users: {}, dynamic users: {})",
+                mechanism, staticCredentials.size(), dynamicCredentials.size());
     }
 
     @Override
@@ -124,136 +158,251 @@ public class DynamicPlainServerCallbackHandler implements AuthenticateCallbackHa
     }
 
     /**
-     * Authenticate user with password
-     * Override this method to add custom business logic
+     * Authenticate user with password using MD5 hash comparison.
      * 
-     * This method checks if the JAAS file has been modified before each
-     * authentication.
-     * If modified, it reloads the credentials from the file into cache.
+     * Authentication flow:
+     * 1. Check if dynamic credential file has been modified and reload if needed
+     * 2. Check static credentials first (from JAAS)
+     * 3. If not found, check dynamic credentials (from file)
+     * 4. Compute MD5 hash of provided password and compare
      * 
+     * Client sends plaintext password, server compares MD5 hash with stored hash.
      */
     protected boolean authenticate(String username, char[] password) throws IOException {
         if (username == null) {
             return false;
         }
 
-        checkAndReloadJaasFile();
+        checkAndReloadDynamicCredentials();
 
         lock.readLock().lock();
         try {
-            String cachedPassword = credentialCache.get(username);
-            return cachedPassword != null
-                    && Utils.isEqualConstantTime(password, cachedPassword.toCharArray());
+            String cachedPassword = staticCredentials.get(username);
+            if (cachedPassword != null) {
+                return Utils.isEqualConstantTime(password, cachedPassword.toCharArray());
+            }
+
+            String cachedPasswordHash = dynamicCredentials.get(username);
+            if (cachedPasswordHash == null) {
+                log.debug("User '{}' not found in credentials", username);
+                return false;
+            }
+
+            String passwordHash = computeMD5Hash(password);
+            if (passwordHash == null) {
+                log.error("Failed to compute MD5 hash for user: {}", username);
+                return false;
+            }
+
+            return Utils.isEqualConstantTime(passwordHash.toCharArray(),
+                    cachedPasswordHash.toCharArray());
 
         } finally {
             lock.readLock().unlock();
         }
     }
 
+    private String computeMD5Hash(char[] password) {
+        byte[] passwordBytes = null;
+        try {
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            passwordBytes = charArrayToByteArray(password);
+            byte[] hashBytes = md.digest(passwordBytes);
+
+            StringBuilder sb = new StringBuilder(32);
+            for (byte b : hashBytes) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            log.error("MD5 algorithm not available", e);
+            return null;
+        } finally {
+            if (passwordBytes != null) {
+                java.util.Arrays.fill(passwordBytes, (byte) 0);
+            }
+        }
+    }
+
+    private byte[] charArrayToByteArray(char[] chars) {
+        java.nio.CharBuffer charBuffer = java.nio.CharBuffer.wrap(chars);
+        java.nio.ByteBuffer byteBuffer = StandardCharsets.UTF_8.encode(charBuffer);
+        byte[] bytes = new byte[byteBuffer.remaining()];
+        byteBuffer.get(bytes);
+        byteBuffer.clear();
+        return bytes;
+    }
+
     /**
-     * Check if JAAS file has been modified and reload if needed
-     * 
-     * This is a lightweight operation that only checks file modification time.
-     * If the file has been modified, it triggers a reload of credentials.
+     * Load static credentials from JAAS configuration.
+     * These credentials are read-only and only loaded once at startup.
+     * Includes admin and system accounts that should not be exposed to users.
      */
-    private void checkAndReloadJaasFile() {
-        if (jaasConfigFilePath == null) {
+    private void loadStaticCredentialsFromJaas(List<AppConfigurationEntry> jaasConfigEntries) {
+        if (jaasConfigEntries == null || jaasConfigEntries.isEmpty()) {
+            log.warn("No JAAS configuration entries provided");
             return;
         }
 
-        File jaasFile = new File(jaasConfigFilePath);
-        if (!jaasFile.exists()) {
-            return;
+        for (AppConfigurationEntry entry : jaasConfigEntries) {
+            Map<String, ?> options = entry.getOptions();
+            for (Map.Entry<String, ?> option : options.entrySet()) {
+                String key = option.getKey();
+                if (key.startsWith(JAAS_USER_PREFIX)) {
+                    String username = key.substring(JAAS_USER_PREFIX.length());
+                    String passwordHash = (String) option.getValue();
+                    staticCredentials.put(username, passwordHash);
+                    log.debug("Loaded static credential for user: {}", username);
+                }
+            }
         }
+        log.info("Loaded {} static users from JAAS configuration", staticCredentials.size());
+    }
 
-        long currentModifiedTime = jaasFile.lastModified();
-
-        if (currentModifiedTime == lastModifiedTime) {
+    /**
+     * Load all dynamic credentials from file at startup.
+     * File format: username=md5hash (one per line)
+     * 
+     * Example:
+     * producer=5f4dcc3b5aa765d61d8327deb882cf99
+     * consumer=098f6bcd4621d373cade4e832627b4f6
+     * app-user=5ebe2294ecd0e0f08eab7690d2a6ee69
+     */
+    private void loadDynamicCredentials() {
+        File file = new File(credentialFile);
+        if (!file.exists() || !file.isFile()) {
+            log.warn("Credential file does not exist: {}", credentialFile);
             return;
         }
 
         lock.writeLock().lock();
         try {
-            // Double-check
-            currentModifiedTime = jaasFile.lastModified();
-            if (currentModifiedTime == lastModifiedTime) {
-                return;
+            dynamicCredentials.clear();
+
+            List<String> lines = Files.readAllLines(file.toPath(), StandardCharsets.UTF_8);
+            long fileModTime = file.lastModified();
+
+            for (String line : lines) {
+                line = line.trim();
+
+                if (line.isEmpty() || line.startsWith("#")) {
+                    continue;
+                }
+
+                int equalsIndex = line.indexOf('=');
+                if (equalsIndex <= 0 || equalsIndex == line.length() - 1) {
+                    log.warn("Invalid credential line format (expected username=hash): {}", line);
+                    continue;
+                }
+
+                String username = line.substring(0, equalsIndex).trim();
+                String passwordHash = line.substring(equalsIndex + 1).trim();
+
+                dynamicCredentials.put(username, passwordHash.toLowerCase());
+                log.debug("Loaded dynamic credential for user: {}", username);
             }
 
-            log.info("JAAS config file modified, reloading credentials from: {}", jaasConfigFilePath);
+            this.lastModifiedTime = fileModTime;
+            log.info("Loaded {} dynamic users from credential file", dynamicCredentials.size());
 
-            // Force reload of JAAS configuration
-            Configuration.setConfiguration(null);
-            Configuration config = Configuration.getConfiguration();
-
-            // Get updated configuration
-            AppConfigurationEntry[] newEntries = config.getAppConfigurationEntry("KafkaServer");
-            if (newEntries != null && newEntries.length > 0) {
-                this.jaasConfigEntries = java.util.Arrays.asList(newEntries);
-            }
-
-            loadCredentialsFromJaas();
-
-            this.lastModifiedTime = currentModifiedTime;
-
-            log.info("Successfully reloaded {} users from JAAS config file", credentialCache.size());
-
-        } catch (Exception e) {
-            log.error("Failed to reload JAAS configuration from file: " + jaasConfigFilePath, e);
+        } catch (IOException e) {
+            log.error("Failed to load credential file: {}", credentialFile, e);
         } finally {
             lock.writeLock().unlock();
         }
     }
 
     /**
-     * Custom business logic for additional authentication checks
-     * Override this method to implement your specific requirements
+     * Check if credential file has been modified and reload if needed.
+     * This method is called before each authentication attempt.
      * 
-     * @param username the authenticated username
-     * @return true if custom checks pass, false otherwise
+     * Performance optimization: Only checks file mtime, only reloads if changed.
      */
-    protected boolean customAuthenticationCheck(String username) {
-        // Example: Add your custom business logic here
-        // - Check user against external database
-        // - Validate user permissions
-        // - Check account status (active/disabled)
-        // - Apply rate limiting
-        // - Log authentication events
+    private void checkAndReloadDynamicCredentials() {
+        if (credentialFile == null) {
+            return;
+        }
 
-        // Default implementation: allow all authenticated users
-        return true;
-    }
+        File file = new File(credentialFile);
+        if (!file.exists()) {
+            return;
+        }
 
-    /**
-     * Load credentials from JAAS configuration into cache
-     * This method should be called with write lock held
-     */
-    private void loadCredentialsFromJaas() {
-        credentialCache.clear();
+        long currentModTime = file.lastModified();
 
-        if (jaasConfigEntries != null) {
-            for (AppConfigurationEntry entry : jaasConfigEntries) {
-                Map<String, ?> options = entry.getOptions();
-                for (Map.Entry<String, ?> option : options.entrySet()) {
-                    String key = option.getKey();
-                    if (key.startsWith(JAAS_USER_PREFIX)) {
-                        String username = key.substring(JAAS_USER_PREFIX.length());
-                        String password = (String) option.getValue();
-                        credentialCache.put(username, password);
-                    }
-                }
+        if (currentModTime == lastModifiedTime) {
+            return;
+        }
+
+        lock.writeLock().lock();
+        try {
+            currentModTime = file.lastModified();
+            if (currentModTime == lastModifiedTime) {
+                return;
             }
-            log.debug("Loaded {} users from JAAS configuration", credentialCache.size());
+
+            log.info("Credential file modified, reloading: {}", credentialFile);
+
+            dynamicCredentials.clear();
+
+            List<String> lines = Files.readAllLines(file.toPath(), StandardCharsets.UTF_8);
+
+            for (String line : lines) {
+                line = line.trim();
+
+                if (line.isEmpty() || line.startsWith("#")) {
+                    continue;
+                }
+
+                int equalsIndex = line.indexOf('=');
+                if (equalsIndex <= 0 || equalsIndex == line.length() - 1) {
+                    log.warn("Invalid credential line format (expected username=hash): {}", line);
+                    continue;
+                }
+
+                String username = line.substring(0, equalsIndex).trim();
+                String passwordHash = line.substring(equalsIndex + 1).trim();
+
+                dynamicCredentials.put(username, passwordHash.toLowerCase());
+            }
+
+            this.lastModifiedTime = currentModTime;
+            log.info("Successfully reloaded {} dynamic users from credential file", dynamicCredentials.size());
+
+        } catch (IOException e) {
+            log.error("Failed to reload credential file: {}", credentialFile, e);
+        } finally {
+            lock.writeLock().unlock();
         }
     }
 
     /**
-     * Get current credential cache size (for monitoring)
+     * Get total number of cached credentials (static + dynamic).
+     * Useful for monitoring and debugging.
      */
     public int getCredentialCacheSize() {
         lock.readLock().lock();
         try {
-            return credentialCache.size();
+            return staticCredentials.size() + dynamicCredentials.size();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Get number of static credentials.
+     */
+    public int getStaticCredentialCount() {
+        return staticCredentials.size();
+    }
+
+    /**
+     * Get number of dynamic credentials.
+     */
+    public int getDynamicCredentialCount() {
+        lock.readLock().lock();
+        try {
+            return dynamicCredentials.size();
         } finally {
             lock.readLock().unlock();
         }
@@ -263,7 +412,8 @@ public class DynamicPlainServerCallbackHandler implements AuthenticateCallbackHa
     public void close() throws KafkaException {
         lock.writeLock().lock();
         try {
-            credentialCache.clear();
+            staticCredentials.clear();
+            dynamicCredentials.clear();
             log.info("DynamicPlainServerCallbackHandler closed");
         } finally {
             lock.writeLock().unlock();
