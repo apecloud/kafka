@@ -54,7 +54,8 @@ import javax.security.auth.login.AppConfigurationEntry;
  * 
  * Features:
  * - Thread-safe credential cache with read-write locks
- * - MD5 password hashing for security
+ * - Static credentials use plaintext passwords (from JAAS)
+ * - Dynamic credentials use MD5 password hashing (from file)
  * - Automatic file reload when modified
  * - Zero-downtime credential updates
  * - Kubernetes Secret/ConfigMap compatible
@@ -73,8 +74,9 @@ import javax.security.auth.login.AppConfigurationEntry;
  * KafkaServer {
  * org.apache.kafka.common.security.plain.PlainLoginModule required
  * username="admin"
- * password="21232f297a57a5a743894a0e4a801fc3"
- * user_admin="21232f297a57a5a743894a0e4a801fc3";
+ * password="admin-secret"
+ * user_client="client-secret"
+ * user_producer="producer-secret";
  * };
  * 
  * 4. Dynamic credential file - user managed, hot-reloadable:
@@ -237,6 +239,10 @@ public class DynamicPlainServerCallbackHandler implements AuthenticateCallbackHa
      * Load static credentials from JAAS configuration.
      * These credentials are read-only and only loaded once at startup.
      * Includes admin and system accounts that should not be exposed to users.
+     * 
+     * Supports two formats:
+     * 1. Admin account: username="admin" password="123456"
+     * 2. Regular users: user_client="123456" user_producer="123456"
      */
     private void loadStaticCredentialsFromJaas(List<AppConfigurationEntry> jaasConfigEntries) {
         if (jaasConfigEntries == null || jaasConfigEntries.isEmpty()) {
@@ -246,12 +252,21 @@ public class DynamicPlainServerCallbackHandler implements AuthenticateCallbackHa
 
         for (AppConfigurationEntry entry : jaasConfigEntries) {
             Map<String, ?> options = entry.getOptions();
+
+            String adminUsername = (String) options.get("username");
+            String adminPassword = (String) options.get("password");
+
+            if (adminUsername != null && adminPassword != null) {
+                staticCredentials.put(adminUsername, adminPassword);
+                log.debug("Loaded static admin credential for user: {}", adminUsername);
+            }
+
             for (Map.Entry<String, ?> option : options.entrySet()) {
                 String key = option.getKey();
                 if (key.startsWith(JAAS_USER_PREFIX)) {
                     String username = key.substring(JAAS_USER_PREFIX.length());
-                    String passwordHash = (String) option.getValue();
-                    staticCredentials.put(username, passwordHash);
+                    String password = (String) option.getValue();
+                    staticCredentials.put(username, password);
                     log.debug("Loaded static credential for user: {}", username);
                 }
             }
