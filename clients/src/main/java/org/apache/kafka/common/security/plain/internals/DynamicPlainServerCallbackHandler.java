@@ -279,9 +279,9 @@ public class DynamicPlainServerCallbackHandler implements AuthenticateCallbackHa
      * File format: username=md5hash (one per line)
      * 
      * Example:
-     * producer=5f4dcc3b5aa765d61d8327deb882cf99
-     * consumer=098f6bcd4621d373cade4e832627b4f6
-     * app-user=5ebe2294ecd0e0f08eab7690d2a6ee69
+     * producer:5f4dcc3b5aa765d61d8327deb882cf99
+     * consumer:098f6bcd4621d373cade4e832627b4f6
+     * app-user:5ebe2294ecd0e0f08eab7690d2a6ee69
      */
     private void loadDynamicCredentials() {
         File file = new File(credentialFile);
@@ -304,7 +304,7 @@ public class DynamicPlainServerCallbackHandler implements AuthenticateCallbackHa
                     continue;
                 }
 
-                int equalsIndex = line.indexOf('=');
+                int equalsIndex = line.indexOf(':');
                 if (equalsIndex <= 0 || equalsIndex == line.length() - 1) {
                     log.warn("Invalid credential line format (expected username=hash): {}", line);
                     continue;
@@ -369,7 +369,7 @@ public class DynamicPlainServerCallbackHandler implements AuthenticateCallbackHa
                     continue;
                 }
 
-                int equalsIndex = line.indexOf('=');
+                int equalsIndex = line.indexOf(':');
                 if (equalsIndex <= 0 || equalsIndex == line.length() - 1) {
                     log.warn("Invalid credential line format (expected username=hash): {}", line);
                     continue;
